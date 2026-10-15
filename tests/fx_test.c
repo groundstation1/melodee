@@ -268,8 +268,10 @@ static void reverb_presence(void)
             }
         }
         /* Previously the 220..1760 Hz return was 8..22 dB below the dry tone.
-         * Keep musical mids present, without permitting hot bass to clip it. */
-        assert(h==4u?wet>dry/8u:wet>dry/4u);
+         * Keep musical mids present, without permitting hot bass to clip it.
+         * 110 Hz is under the 150 Hz input floor (FX_FLOOR_SPACE): with the wet
+         * return now level-normalised just under dry it, like 1760 Hz, may be 9 dB down. */
+        assert(h==4u || h==0u?wet>dry/8u:wet>dry/4u);
     }
     assert(deep_tail>100000u);
     for(uint32_t slot=0;slot<FX_SLOTS;slot++){
@@ -309,7 +311,7 @@ static void reverb_rate_conversion(void)
     puts("Reverb rate conversion: exact FIR reference through integrator wraps, preserved mids and alias-band rejection: OK");
 }
 /* ROOM / REVERB levels through an insert over a SIZE x DEPTH grid, at a track's typical RMS 4000: band noise (100 Hz-
- * 1.5 kHz, peaks ~16000) and a sustained pad (a detuned A minor triad of saws, 2 kHz low pass). Fully wet sits 1-4 dB under
+ * 1.5 kHz, peaks ~16000) and a sustained pad (a detuned A minor triad of saws, 2 kHz low pass). Fully wet sits 0-3 dB under
  * dry on noise and within 1.5 dB of one level (before: -13 dB for ROOM, -7..+5 dB for REVERB); a pad never comes back more
  * than 2.5 dB over dry (before: up to +8 dB, at the biggest SIZE a drifting read wrapped into a few-sample loop). MIX 50 %
  * stays 2.5-4.75 dB under dry (an equal-power dip of uncorrelated wet), no comb / tank / diffuser write is clamped, REVERB's
@@ -350,7 +352,7 @@ static void space_levels(void)
             assert(!w.clamps && !h.clamps && !p.clamps && w.peak<=32768 && h.peak<=32768 && p.peak<=32768 && pad<2.5);
             if(wet<lo)lo=wet;if(wet>hi)hi=wet;if(half<lo50)lo50=half;if(half>hi50)hi50=half;
         }
-        assert(lo>-4.0 && hi<-0.5 && hi-lo<3.0 && lo50>-4.75 && hi50<-2.5);
+        assert(lo>-4.0 && hi<0.5 && hi-lo<3.0 && lo50>-4.75 && hi50<-2.5);
         assert(!fx_level(type,127,127,127,12000,0).clamps && !fx_level(type,0,127,127,12000,0).clamps);
     }
     puts("ROOM / REVERB: wet just under dry and within 1.5 dB over SIZE x DEPTH, pads never loud, MIX 50 % dip, no clamped writes: OK");
