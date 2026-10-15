@@ -7,7 +7,8 @@
  * (the pattern, the next one waiting for the bar; one track: ARP, HOLD, CHORD, the scale too), the bar playing as
  * 4 x 4 steps at the right (one, two tracks: 16 in a row under the words); each row tinted in its track's colour, the
  * selected one more and outlined in it; the pattern a pill in it. No level (MIXER has it). Under them the band (rows 210 .. 239): the notes the selected track played and
- * their chord over its waveform, faint (a DRUM track: its lanes, lit as they hit). The first turn of a knob drops the
+ * their chord over its waveform, faint (a DRUM track: its lanes, lit as they hit); the menu's HOME NOTES (ui.c home_notes)
+ * DRUMS: a DRUM track's lanes alone (another track: its waveform), OFF: no band, the rows 32 .. 237. The first turn of a knob drops the
  * track's four knobs (its engine's, stage_page) in as the pages' strip (ST_DROP frames) and under them what the knob
  * turning shapes (a filter's response, an envelope, the waveform), nothing over it; ST_KNOB_MS after the last turn they
  * go and the rows are whole again. An armed track's row has a soft red border (stage_rec_paint): breathing while it
@@ -18,6 +19,7 @@
  */
 #define ST_ROW_Y 32                                     /* the rows: 32 .. 205, 2 px apart */
 #define ST_ROWS_H 174
+#define ST_ROWS_FULL 206                                /* HOME NOTES OFF: the rows 32 .. 237, the band's rows theirs */
 #define ST_BAND_Y 210                                   /* the band: rows 210 .. 239 */
 #define ST_BAND_H 30
 #define ST_KNOB_MS 1500u                                /* the knobs stay this long after the last turn */
@@ -25,12 +27,17 @@
 #define ST_PMIN 5                                       /* the steps' smallest dot pitch (px) */
 #define ST_PMAX 12                                      /* .. and the largest */
 
-static int32_t st_row_h(void)
+static int32_t st_rows_row_h(int32_t rows)
 {
     int32_t n = (int32_t)trk_n();
-    return (ST_ROWS_H - 2 * (n - 1)) / n;
+    return (rows - 2 * (n - 1)) / n;
 }
+static int32_t st_row_h(void) { return st_rows_row_h(ST_ROWS_H); }   /* (MIXER's rows: Stage's with the band) */
 static int32_t st_row_y(uint32_t k) { return ST_ROW_Y + (int32_t)k * (st_row_h() + 2); }
+/* Stage's rows: the band's rows theirs too when HOME NOTES is OFF */
+static int stage_band_on(void) { return home_notes() != HN_OFF; }
+static int32_t stage_row_h(void) { return st_rows_row_h(stage_band_on() ? ST_ROWS_H : ST_ROWS_FULL); }
+static int32_t stage_row_y(uint32_t k) { return ST_ROW_Y + (int32_t)k * (stage_row_h() + 2); }
 /* the x of a text centred on cx in at most maxw px */
 static int32_t st_mid_x(int32_t cx, const aafont_t *f, const char *s, int32_t maxw)
 {
@@ -262,13 +269,14 @@ static void stage_panel_hits(void)                      /* every frame: the DRUM
     for (l = 0; l < NLANE; l++)
         stage.hit_t[l] = (f[sel] >> l) & 1u ? 10u : stage.hit_t[l] ? stage.hit_t[l] - 1u : 0u;
 }
-/* the band: the selected track's waveform, faint, the chord and notes in front (a DRUM track: its lanes) */
+/* the band: the selected track's waveform, faint, the chord and notes in front (a DRUM track: its lanes); HOME NOTES
+ * DRUMS: another track's waveform alone */
 static void stage_band(void)
 {
-    uint32_t sel = song.sel % NTRK, drum = (uint32_t)drum_track(TSEL), i;
+    uint32_t sel = song.sel % NTRK, drum = (uint32_t)drum_track(TSEL), notes = home_notes() == HN_ON, i;
     int held = 0;
     cv_begin(240, ST_BAND_H, T_BG);
-    if (!drum) {
+    if (!drum && notes) {
         fm1_irq_off();
         for (i = 0; i < 4u; i++) held |= live_held[sel][i] != 0u;
         fm1_irq_on();
@@ -276,7 +284,7 @@ static void stage_band(void)
     cv_over = 1;                                        /* (blended over what is there) */
     if (drum)
         stage_hits();
-    else if (!stage_notes(228, ST_BAND_H / 2)) {        /* nothing played yet: the waveform alone */
+    else if (!notes || !stage_notes(228, ST_BAND_H / 2)) {        /* nothing played yet: the waveform alone */
         cv_over = 0;
         stage_wave(ux_mix(T_BG, T_THEME, 45), 1, ST_BAND_H - 2);
     }
@@ -447,7 +455,7 @@ static void stage_row(uint32_t k)
     uint32_t next = t->pattern_next < NPAT ? t->pattern_next + 1u : 0u, sig, src, kk, cat, g;
     uint32_t n = trk_n(), wide = n == 1u, idle = wide && stage_seq_idle(k);
     int pending = sel && browse_pending();
-    int32_t h = st_row_h(), y = st_row_y(k), top, cs = h >= 80 ? 34 : 26, tx = 6 + cs + 10, room = BOX_W - 6 - tx;
+    int32_t h = stage_row_h(), y = stage_row_y(k), top, cs = h >= 80 ? 34 : 26, tx = 6 + cs + 10, room = BOX_W - 6 - tx;
     st_lay_t lay = {4, 4, 1, 1, ST_PMIN, 0, 0};
     int32_t steps_row = h >= 80, showrole = 1;          /* (one, two tracks: the role under the name; three, four: beside it,
                                                          * at the right) */
@@ -601,12 +609,14 @@ static void stage_knobs(void)
         stage.out = 1;
         stage.drop = ST_DROP;
         lcd_fill(0, Y_LABEL, 240, Y_GRAPH - Y_LABEL, T_BG);   /* (the rows under the strip go at once) */
+        if (!ui.home_pg && !stage_band_on())            /* (no band: the rows under the picture too) */
+            lcd_fill(0, Y_GRAPH + H_GRAPH, 240, 240u - (Y_GRAPH + H_GRAPH), T_BG);
     } else if (!out && stage.out) {
         stage.out = 0;
         memset(stage.col, 0, sizeof stage.col);         /* (the rows back, HOME's second page whole) */
         view_reset();
         memset(ui.col, 0, sizeof ui.col);
-        lcd_fill(0, Y_LABEL, 240, ST_BAND_Y - Y_LABEL, T_BG);
+        lcd_fill(0, Y_LABEL, 240, (!ui.home_pg && !stage_band_on() ? 240u : ST_BAND_Y) - Y_LABEL, T_BG);
         return;
     }
     if (!stage.out)
@@ -639,5 +649,6 @@ static void stage_draw(void)
         stage_shape();
     for (k = 0; k < trk_n(); k++)
         stage_row(k);
-    stage_band();
+    if (stage_band_on())
+        stage_band();
 }
