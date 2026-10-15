@@ -1,0 +1,56 @@
+name: FX levels CI (fork only)
+on:
+  push:
+    branches: ['ci/**']
+jobs:
+  test:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 90
+    env:
+      JIELI_TOOLCHAIN: ${{ github.workspace }}/.deps/jieli/toolchain
+      AC79_SDK: ${{ github.workspace }}/.deps/sdk
+      PARALLEL: '4'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libharfbuzz-dev libfribidi-dev libraqm-dev
+          python -m pip install Pillow fonttools
+      - uses: actions/cache@v4
+        with:
+          path: .deps
+          key: jieli-linux-sdk-d179b448-v1
+      - name: Fetch pinned SDK and toolchain
+        run: |
+          if [ ! -x "$JIELI_TOOLCHAIN/pi32v2/bin/clang" ]; then tools/get_toolchain.sh "$GITHUB_WORKSPACE/.deps/jieli"; fi
+          if [ ! -d "$AC79_SDK/.git" ]; then
+            git clone --depth 1 --branch AC79NN_SDK_V1.2.1_2023-12-13 https://gitee.com/Jieli-Tech/fw-AC79_AIoT_SDK.git "$AC79_SDK"
+          fi
+      - name: Build
+        run: ./build.sh
+      - name: FX test (level table)
+        run: |
+          mkdir -p build/host
+          cc -O1 -ffp-contract=off -Wall -Wno-unused-function -w -Ibuild/gen -Ifirmware/src -o build/host/fx_test tests/fx_test.c -lm
+          build/host/fx_test | tee build/fx_test.txt
+      - name: Full host suite
+        run: tests/run_tests.sh 2>&1 | tee build/run_tests.txt; exit ${PIPESTATUS[0]}
+        shell: bash
+      - name: Golden update preview
+        if: always()
+        run: |
+          python3 tests/target_budget.py build/melodee.dis tests/target_budget.txt > build/target_budget.txt 2>&1 || true
+          GOLDEN_UPDATE=1 SOUND=only tests/run_tests.sh > build/golden_update.txt 2>&1 || true
+          git diff tests/ > build/tests.diff || true
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: results
+          path: |
+            build/*.txt
+            build/tests.diff
+            build/host/log
