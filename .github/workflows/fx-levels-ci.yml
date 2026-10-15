@@ -31,7 +31,21 @@ jobs:
             git clone --depth 1 --branch AC79NN_SDK_V1.2.1_2023-12-13 https://gitee.com/Jieli-Tech/fw-AC79_AIoT_SDK.git "$AC79_SDK"
           fi
       - name: Build
-        run: ./build.sh
+        run: ./build.sh 2>&1 | tee "$RUNNER_TEMP/build_log.txt"; exit ${PIPESTATUS[0]}
+        shell: bash
+      - name: Reverb v2 measurements
+        if: always()
+        shell: bash
+        run: |
+          mkdir -p build/host; cp "$RUNNER_TEMP/build_log.txt" build/ || true
+          python3 .github/ci-bench/disdump.py build/melodee.dis fx_reverb fx_hall fx_hall_setup fx_reverb_setup fx_slot_run > build/fx_dis.txt || true
+          cc -O2 -w -Ibuild/gen -Ifirmware/src -o build/host/fx_perf tests/fx_performance.c -lm && build/host/fx_perf > build/fx_performance.csv || true
+          cc -O2 -w -DMELODEE_FX_HALL_INSERTS=1 -Ibuild/gen -Ifirmware/src -o build/host/fx_perf_hall tests/fx_performance.c -lm && build/host/fx_perf_hall > build/fx_performance_hall_inserts.csv || true
+          python3 .github/ci-bench/extract.py firmware/src/fx.c .github/ci-bench/fx_kernels.h
+          cc -O2 -g -w -I.github/ci-bench -Ibuild/gen -o build/host/harness .github/ci-bench/harness.c -lm
+          sudo apt-get install -y valgrind
+          for k in 1 2; do valgrind --tool=callgrind --callgrind-out-file=build/cg.$k.out build/host/harness $k cg 4000 && callgrind_annotate --inclusive=yes build/cg.$k.out | head -40 > build/callgrind_$k.txt; done || true
+          for k in 1 2; do build/host/harness $k bench; build/host/harness $k levels; done > build/harness.txt 2>&1 || true
       - name: FX test (level table)
         run: |
           mkdir -p build/host
@@ -52,5 +66,6 @@ jobs:
           name: results
           path: |
             build/*.txt
+            build/*.csv
             build/tests.diff
             build/host/log
