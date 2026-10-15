@@ -87,6 +87,13 @@ static uint32_t home_select(void) { return HOME_SELECT < HS_N ? HOME_SELECT : HS
 #define GLO_SELECT (favorites.factory[15][24])
 static uint32_t glo_select(void) { return ((GLO_SELECT >> 1) & 15u) < HS_N ? (GLO_SELECT >> 1) & 15u : HS_BPM; }
 static void glo_select_set(uint32_t v) { GLO_SELECT = (uint8_t)((GLO_SELECT & ~0x1Eu) | (v & 15u) << 1); }
+/* HOME NOTES (the menu): Stage's band, what the selected track plays (ui_stage.c stage_band): ON its notes and chord
+ * (a DRUM track: its lanes), DRUMS a DRUM track's lanes alone (another track: its waveform), OFF none (the rows take its
+ * rows); kept in bits 5..6 of favorites.factory[15][24] (0, any other: ON) */
+enum { HN_ON, HN_DRUMS, HN_OFF, HN_N };
+static const char *const HN_NAME[HN_N] = {"ON", "DRUMS", "OFF"};
+static uint32_t home_notes(void) { return ((GLO_SELECT >> 5) & 3u) < HN_N ? (GLO_SELECT >> 5) & 3u : HN_ON; }
+static void home_notes_set(uint32_t v) { GLO_SELECT = (uint8_t)((GLO_SELECT & ~0x60u) | (v % HN_N) << 5); }
 
 static uint8_t sync_reload;                  /* engine / preset / project / user preset loaded: editor RELOAD push */
 

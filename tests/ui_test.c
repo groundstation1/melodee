@@ -5315,6 +5315,103 @@ static int test_seq_keys(void)
     ui_power_on();
     return bad;
 }
+/* pixels of screen row y, x 10 .. 229, in colour c; of rows y0 .. y1 */
+static uint32_t band_count(int32_t y0, int32_t y1, uint16_t c)
+{
+    uint32_t n = 0;
+    int32_t x, y;
+    for (y = y0; y <= y1; y++)
+        for (x = 10; x < 230; x++)
+            n += swap16(host_screen[y * 240 + x]) == c;
+    return n;
+}
+/* HOME NOTES (the menu): Stage's band of what plays ON (notes and chord; a DRUM track its lanes), DRUMS (a DRUM
+ * track's lanes alone), OFF (no band, the rows taking its rows); in the menu, kept with the settings */
+static int test_home_band(void)
+{
+    int bad = 0;
+    uint32_t i;
+    ui_power_on();
+    GLO_SELECT = 0;
+    bad += check("HOME NOTES: ON by default (the band as before)", home_notes() == HN_ON && stage_band_on());
+    song.ntrk = 4;
+    bad += check("  four tracks: rows of 42 px over the band", stage_row_h() == 42 && stage_row_y(3) == 32 + 3 * 44);
+    home_notes_set(HN_DRUMS);
+    bad += check("  DRUMS: the band kept, the rows as they were", stage_band_on() && stage_row_h() == 42);
+    home_notes_set(HN_OFF);
+    bad += check("  OFF: the rows take the band's rows (four of 50 px, to row 237)",
+                 !stage_band_on() && stage_row_h() == 50 && stage_row_y(3) + stage_row_h() == 238);
+    bad += check("  OFF: MIXER's rows unchanged", st_row_h() == 42);
+    song.ntrk = 1;
+    bad += check("  OFF, one track: a row of 206 px", stage_row_h() == 206);
+    GLO_SELECT = 0x1Fu;                                 /* (a CZ-1 star, GLO SELECT beside it) */
+    home_notes_set(HN_DRUMS);
+    bad += check("  stored beside GLO SELECT and the CZ-1 star", (GLO_SELECT & 0x1Fu) == 0x1Fu && home_notes() == HN_DRUMS);
+    GLO_SELECT = 0x60u;
+    bad += check("  an unknown stored value: ON", home_notes() == HN_ON);
+    {
+        persist_t ps;
+        memset(&ps, 0, sizeof ps);
+        GLO_SELECT = 0;
+        home_notes_set(HN_OFF);
+        glo_select_set(HS_SWING);
+        settings_export(&ps);
+        GLO_SELECT = 0;
+        settings_import(&ps, (int)sizeof ps);
+        bad += check("  kept with the settings (GLO SELECT too)", home_notes() == HN_OFF && glo_select() == HS_SWING);
+    }
+
+    /* drawn: a chord held on a synth track, then a DRUM track selected */
+    ui_power_on();
+    GLO_SELECT = 0;
+    song.ntrk = 1;
+    go_home();
+    midi_event(0x90, 0, 60, 100); midi_event(0x90, 0, 64, 100); midi_event(0x90, 0, 67, 100);
+    screen_clear(); ui.force = 1; frame();
+    bad += check("  ON: the chord held, in the band", band_count(210, 239, T_TEXT) > 20u);
+    home_notes_set(HN_DRUMS);
+    screen_clear(); ui.force = 1; frame();
+    bad += check("  DRUMS: a synth track's notes not shown (its waveform alone)", band_count(210, 239, T_TEXT) == 0u &&
+                 band_count(236, 236, T_BG) > 200u);
+    home_notes_set(HN_OFF);
+    screen_clear(); ui.force = 1; frame();
+    bad += check("  OFF: no notes, the row whole to its foot", band_count(210, 239, T_TEXT) == 0u &&
+                 band_count(230, 230, T_BG) == 0u && band_count(236, 236, T_BG) == 0u);
+    turn(EN_K1, 1);
+    for (i = 0; i < 8u; i++) frame();
+    bad += check("  OFF, a knob turned: the row's foot cleared under the knobs' picture",
+                 stage.out && band_count(210, 239, T_BG) == 30u * 220u);
+    midi_event(0x80, 0, 60, 0); midi_event(0x80, 0, 64, 0); midi_event(0x80, 0, 67, 0);
+    set_engine_of(TSEL, ENGI_DRUM);
+    go_home();
+    home_notes_set(HN_DRUMS);
+    screen_clear(); ui.force = 1; frame();
+    bad += check("  DRUMS: a DRUM track's lanes in the band", band_count(214, 234, T_DIM) > 20u);
+    home_notes_set(HN_OFF);
+    screen_clear(); ui.force = 1; frame();
+    bad += check("  OFF: no lanes either", band_count(214, 234, T_DIM) == 0u);
+
+    /* the menu: OCT+ steps ON DRUMS OFF and wraps, KNOB 1 steps and stops */
+    ui_power_on();
+    GLO_SELECT = 0;
+    hold(B_HOME);
+    for (i = 0; i < MI_COUNT && ui.menu_sel != MI_HOME_NOTES; i++)
+        turn(EN_PRESET, 1);
+    press(B_OCTUP);
+    bad += check("  Settings > HOME NOTES: OCT+ steps it (ON -> DRUMS)", ui.menu && home_notes() == HN_DRUMS);
+    press(B_OCTUP);
+    bad += check("  .. (DRUMS -> OFF)", ui.menu && home_notes() == HN_OFF);
+    press(B_OCTUP);
+    bad += check("  .. and wraps (OFF -> ON)", ui.menu && home_notes() == HN_ON);
+    for (i = 0; i < 3u; i++)
+        turn(EN_K1, 1);
+    bad += check("  KNOB 1 right: up to OFF, and stays", home_notes() == HN_OFF);
+    turn(EN_K1, -1);
+    bad += check("  KNOB 1 left: DRUMS", home_notes() == HN_DRUMS);
+    GLO_SELECT = 0;
+    ui_power_on();
+    return bad;
+}
 int main(void)
 {
     setvbuf(stdout, NULL, _IONBF, 0);
@@ -5338,6 +5435,7 @@ int main(void)
     bad += test_home_view();
     bad += test_home_view_release();
     bad += test_home_select();
+    bad += test_home_band();
     bad += test_seq_keys();
     bad += test_pattern_key_handoff();
     bad += test_loop_end_edits();
