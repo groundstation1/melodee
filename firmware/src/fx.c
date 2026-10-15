@@ -258,6 +258,7 @@ static __attribute__((noinline,section(".dsp_text"))) void fx_time(fx_state_t *r
     static const uint16_t len[4]={149,211,263,293};
     int32_t mix=f->mix;uint32_t delay=110u+(uint32_t)f->rate*31u;
     int32_t feedback=f->type==FX_ECHO?f->character*220:12000+f->character*120;
+    int32_t room_in=13800-f->character*34;     /* ROOM's input, /65536: DEPTH's longer ring builds up more */
     if(f->type==FX_ROOM && (!f->rev_span[0] || f->rev_rate!=f->rate)){
         f->rev_rate=f->rate;for(uint32_t k=0;k<4u;k++)f->rev_span[k]=(uint16_t)((uint32_t)len[k]*(64u+(uint32_t)f->rate)/191u);
     }
@@ -278,11 +279,11 @@ static __attribute__((noinline,section(".dsp_text"))) void fx_time(fx_state_t *r
                     if(f->comb[k]>=span)f->comb[k]=0;
                     int32_t x=mem[off+f->comb[k]];
                     f->damp[k]+=fx_div_pow2(x-f->damp[k],2);
-                    mem[off+f->comb[k]]=(int16_t)clamp(fx_div_pow2(mono,2)+fx_div_pow2(f->damp[k]*feedback,15),-32767,32767);
+                    mem[off+f->comb[k]]=(int16_t)clamp(fx_div_pow2(mono*room_in,16)+fx_div_pow2(f->damp[k]*feedback,15),-32767,32767);
                     if(++f->comb[k]>=span)f->comb[k]=0;off+=len[k];sum[k&1u]+=x;
                 }
                 /* Combs 0 + 2 left, 1 + 3 right: one kind of signal at one scale on both sides.
-                 * The quarter-scale input keeps the combs' headroom; x3 makes the return up. */
+                 * The ~quarter-scale input keeps the combs' headroom; x3 makes the return up. */
                 f->rev_l=sum[0]*3;f->rev_r=sum[1]*3;
             }
         }
@@ -324,7 +325,7 @@ static __attribute__((noinline,section(".audio_text"))) void fx_chorus(fx_state_
 static const uint16_t REV_LEN[8] __attribute__((section(".data.fx_lengths")))={131,149,167,191,211,233,251,277};
 static const uint16_t REV_AP_LEN[8] __attribute__((section(".data.fx_lengths")))={23,31,43,61,19,29,37,47};
 #define FX_REVERB_BYTES 4096u
-#define FX_REV_LEVEL 920                         /* the wet make-up gain, /256 */
+#define FX_REV_LEVEL 740                         /* the wet make-up gain, /256: ~2 dB under dry */
 /* fx_reverb_setup keeps the input's normalisation (Q16) in the idle ROOM history damp[3]. */
 static void fx_reverb_setup(fx_state_t *f)
 {
@@ -332,15 +333,17 @@ static void fx_reverb_setup(fx_state_t *f)
     f->rev_rate=f->rate;f->rev_char=f->character;
     float decay=300.0f+(float)(f->character*f->character)*(5700.0f/(127.0f*127.0f)),loss=0;
     for(uint32_t k=0;k<8u;k++){
-        f->rev_span[k]=(uint16_t)((uint32_t)REV_LEN[k]*(64u+(uint32_t)f->rate)/191u);
+        /* The drift reads up to 4 samples further back, the interpolation one more: the
+         * longest span stays 5 short of the ring, or a big SIZE wraps to a few-sample loop. */
+        f->rev_span[k]=(uint16_t)((uint32_t)(REV_LEN[k]-5u)*(64u+(uint32_t)f->rate)/191u);
         float x=6.907755f*(float)f->rev_span[k]*(1000.0f*FX_REV_DIV)/((float)FS*decay);
         float g=(1.0f-x*0.5f)/(1.0f+x*0.5f);
-        f->rev_gain[k]=(int32_t)(65536.0f*g);loss+=(1.0f-0.85f*g*g)*0.125f;
+        f->rev_gain[k]=(int32_t)(65536.0f*g);loss+=(1.0f-0.92f*g*g)*0.125f;
     }
     /* An orthogonal tank of round trip gain g holds 1 / (1 - g^2) of its input's power, so
      * the input is scaled by sqrt(1 - g^2): the same steady wet level at every SIZE / DEPTH,
      * and the lines keep their headroom at long decays. The damping and the drift's fractional
-     * reads take ~15 % of a round trip's power (0.85, measured on band noise: +/-1.5 dB over
+     * reads take ~8 % of a round trip's power (0.92, measured on band noise: +/-1 dB over
      * the SIZE x DEPTH grid). Newton's root: setup runs only when a control moves. */
     float root=1.0f;for(uint32_t k=0;k<6u;k++)root=0.5f*(root+loss/root);
     f->damp[3]=(int32_t)(65536.0f*root);
