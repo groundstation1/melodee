@@ -325,7 +325,7 @@ static __attribute__((noinline,section(".audio_text"))) void fx_chorus(fx_state_
 static const uint16_t REV_LEN[8] __attribute__((section(".data.fx_lengths")))={131,149,167,191,211,233,251,277};
 static const uint16_t REV_AP_LEN[8] __attribute__((section(".data.fx_lengths")))={23,31,43,61,19,29,37,47};
 #define FX_REVERB_BYTES 4096u
-#define FX_REV_LEVEL 740                         /* the wet make-up gain, /256: ~2 dB under dry */
+#define FX_REV_LEVEL 780                         /* the wet make-up gain, /256: ~1 dB under dry */
 /* fx_reverb_setup keeps the input's normalisation (Q16) in the idle ROOM history damp[3]. */
 static void fx_reverb_setup(fx_state_t *f)
 {
@@ -396,7 +396,7 @@ static __attribute__((noinline,section(".dsp_text"))) void fx_reverb(fx_state_t 
             /* Cheap rate-conversion compensation restores upper-mid body
              * without increasing the bass return or allocating another filter. */
             int32_t previous_input=f->damp[2];f->damp[2]=input;
-            input+=fx_div_pow2(input-previous_input,2);
+            input+=fx_div_pow2(input-previous_input,1);
             input=fx_tone_input(f,input,FX_REV_DIV/(0.010f*FS));
             int32_t v[8],x;uint32_t off=0;
             f->rev_dc+=((float)input-f->rev_dc)*0.006f;
