@@ -468,7 +468,7 @@ static __attribute__((noinline,section(".dsp_text"))) void fx_reverb(fx_state_t 
 #define FX_HALL_DIFFUSERS 922u                   /* HALL_AP_LEN's sum */
 #define FX_HALL_SAMPLES (FX_HALL_LINES+FX_HALL_DIFFUSERS)
 #define FX_HALL_BYTES 12288u
-#define FX_HALL_LEVEL 640                        /* the wet make-up gain, /256 */
+#define FX_HALL_LEVEL 500                        /* the wet make-up gain, /256 */
 #define FX_HALL_LOSS 0.98f                       /* the power a round trip's drifting read loses */
 #define FX_HALL_BASS 0.25f                       /* the low shelf's decay time over the mids' */
 #define FX_HALL_COS 0.94210f                     /* cos, sin of 600 Hz at FS / 4 */
@@ -576,7 +576,9 @@ static __attribute__((noinline,section(".audio_text"))) void fx_hall(fx_state_t 
                 h->damp[k]+=fx_reverb_mul(y-h->damp[k],65536u-(uint32_t)h->high[k]);
                 v[k]=fx_div_pow2(h->damp[k],8);at+=len;
             }
-            int32_t l=fx_div_pow2(v[0]-v[2]+v[4]-v[6],1),r=fx_div_pow2(v[1]-v[3]+v[5]-v[7],1);
+            /* Inputs and outputs take one sign in four against the others: a Walsh row (+-+-)
+             * would gather what a side injects into two lines after the Hadamard, a comb. */
+            int32_t l=fx_div_pow2(v[0]-v[2]+v[4]+v[6],1),r=fx_div_pow2(v[3]+v[5]+v[7]-v[1],1);
             FX_HALL_BF(0,1)FX_HALL_BF(2,3)FX_HALL_BF(4,5)FX_HALL_BF(6,7)
             FX_HALL_BF(0,2)FX_HALL_BF(1,3)FX_HALL_BF(4,6)FX_HALL_BF(5,7)
             FX_HALL_BF(0,4)FX_HALL_BF(1,5)FX_HALL_BF(2,6)FX_HALL_BF(3,7)
@@ -586,7 +588,7 @@ static __attribute__((noinline,section(".audio_text"))) void fx_hall(fx_state_t 
             at=0;
             for(uint32_t k=0;k<8u;k++){
                 uint32_t len=HALL_LEN[k]+FX_HALL_SLACK;int32_t in=cross[k&1u];
-                line[at+h->pos[k]]=(int16_t)clamp(fx_reverb_mul(v[k],(uint32_t)h->gain[k])+((k&2u)?-in:in),-32767,32767);
+                line[at+h->pos[k]]=(int16_t)clamp(fx_reverb_mul(v[k],(uint32_t)h->gain[k])+(k==5u || k==6u?-in:in),-32767,32767);
                 if(++h->pos[k]>=len)h->pos[k]=0;at+=len;
             }
             l=fx_hall_ap(&h->ap[8],HALL_AP_LEN[8],line+off,l);off+=HALL_AP_LEN[8];

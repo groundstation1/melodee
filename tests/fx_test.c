@@ -637,7 +637,7 @@ static void boom_test(void)
     puts("No boom: ECHO, ROOM and REVERB keep their bass under their mids, no low note ringing over them: OK");
     puts("Not harsh, not thin: their highs under the mids, no high note ringing over them, the bass within 15 dB: OK");
 }
-/* REVERB in the shared rack (fx_hall): the same levels as the inserts' (space_levels) from the send, both sides fed,
+/* REVERB in the shared rack (fx_hall): the inserts' levels and pad bound (space_levels) from the send, both sides fed,
  * exact silence after its tail, DEPTH's decay, a one-sided source reaching both outputs, the polyphase FIR's image
  * rejection and, measured on 1/3-octave noise (single sines scatter by +/-7 dB over its long decays' modes), no boom,
  * not thin and not harsh. */
@@ -662,18 +662,26 @@ static void hall_block(const int32_t *l,const int32_t *r)
     memcpy(fx_send_l,l,sizeof fx_send_l);memcpy(fx_send_r,r,sizeof fx_send_r);
     fx_bus_start(CTL);fx_bus_join();assert(fx_bus_result);
 }
-static fx_level_t hall_level(int rate,int cha,int mix,double rms,int stereo)
+/* fx_level's band noise (independent sides with stereo) or its pad, through the send */
+static fx_level_t hall_level(int rate,int cha,int mix,double rms,int stereo,int pad)
 {
     hall_bus(rate,cha,mix);
-    int32_t rng[2]={12345,777},l[CTL],r[CTL];double hp[2]={0},lp1[2]={0},lp2[2]={0};fx_level_t res={0};
-    const double a=1-exp(-6.283185307*100.0/FS),c=1-exp(-6.283185307*1500.0/FS);
+    static const double hz[6]={220,220.9,261.6,262.5,329.6,330.8};
+    int32_t rng[2]={12345,777},l[CTL],r[CTL];uint32_t ph[6]={0};double hp[2]={0},lp1[2]={0},lp2[2]={0};fx_level_t res={0};
+    const double a=1-exp(-6.283185307*100.0/FS),c=1-exp(-6.283185307*1500.0/FS),d=1-exp(-6.283185307*2000.0/FS);
     for(uint32_t frame=0;frame<4u*FS/CTL;frame++){
-        for(uint32_t i=0;i<CTL;i++)for(uint32_t ch=0;ch<2u;ch++){
-            double w=(int32_t)noise32(&rng[ch])/2147483648.0*1.7320508;
-            hp[ch]+=(w-hp[ch])*a;lp1[ch]+=(w-hp[ch]-lp1[ch])*c;lp2[ch]+=(lp1[ch]-lp2[ch])*c;
-            (ch?r:l)[i]=clamp((int32_t)lrint(lp2[ch]*3.2*rms),-65536,65536);
+        for(uint32_t i=0;i<CTL;i++){
+            if(pad){
+                double x=0;for(uint32_t k=0;k<6;k++){ph[k]+=(uint32_t)(hz[k]*4294967296.0/FS);x+=(int32_t)ph[k]/2147483648.0;}
+                lp1[0]+=(x-lp1[0])*d;l[i]=clamp((int32_t)lrint(lp1[0]*0.75*rms),-65536,65536);continue;
+            }
+            for(uint32_t ch=0;ch<2u;ch++){
+                double w=(int32_t)noise32(&rng[ch])/2147483648.0*1.7320508;
+                hp[ch]+=(w-hp[ch])*a;lp1[ch]+=(w-hp[ch]-lp1[ch])*c;lp2[ch]+=(lp1[ch]-lp2[ch])*c;
+                (ch?r:l)[i]=clamp((int32_t)lrint(lp2[ch]*3.2*rms),-65536,65536);
+            }
         }
-        if(!stereo)memcpy(r,l,sizeof r);
+        if(!stereo || pad)memcpy(r,l,sizeof r);
         hall_block(l,r);res.clamps+=hall_clamps();
         if(frame>=2u*FS/CTL)for(uint32_t i=0;i<CTL;i++){
             res.dry+=((double)l[i]*l[i]+(double)r[i]*r[i])/2;res.out+=((double)fx_left[i]*fx_left[i]+(double)fx_right[i]*fx_right[i])/2;
@@ -716,14 +724,15 @@ static void hall_test(void)
     for(uint32_t stereo=0;stereo<2u;stereo++){
         double lo=99,hi=-99,lo50=99,hi50=-99;
         for(int rate=0;rate<=127;rate+=rate?63:64)for(int cha=0;cha<=127;cha+=cha?63:64){
-            fx_level_t w=hall_level(rate,cha,127,4000,(int)stereo),h=hall_level(rate,cha,64,4000,(int)stereo);
-            double wet=10*log10(w.out/w.dry),half=10*log10(h.out/h.dry);
-            printf("shared REVERB (%s) SIZE %3d DEPTH %3d: wet %+.1f dB, MIX 50 %% %+.1f dB\n",stereo?"stereo":"mono",rate,cha,wet,half);
-            assert(!w.clamps && !h.clamps && w.peak<=65536 && h.peak<=65536);
+            fx_level_t w=hall_level(rate,cha,127,4000,(int)stereo,0),h=hall_level(rate,cha,64,4000,(int)stereo,0);
+            fx_level_t p=hall_level(rate,cha,127,4000,0,1);
+            double wet=10*log10(w.out/w.dry),half=10*log10(h.out/h.dry),pad=10*log10(p.out/p.dry);
+            printf("shared REVERB (%s) SIZE %3d DEPTH %3d: wet %+.1f dB, MIX 50 %% %+.1f dB, pad wet %+.1f dB\n",stereo?"stereo":"mono",rate,cha,wet,half,pad);
+            assert(!w.clamps && !h.clamps && !p.clamps && w.peak<=65536 && h.peak<=65536 && pad<2.5);
             if(wet<lo)lo=wet;if(wet>hi)hi=wet;if(half<lo50)lo50=half;if(half>hi50)hi50=half;
         }
-        assert(lo>-1.0 && hi<3.5 && hi-lo<4.0 && lo50>-3.25 && hi50<3.0);
-        assert(!hall_level(127,127,127,12000,(int)stereo).clamps && !hall_level(0,127,127,12000,(int)stereo).clamps);
+        assert(lo>-4.0 && hi<0.5 && hi-lo<3.0 && lo50>-4.75 && hi50<-2.5);
+        assert(!hall_level(127,127,127,12000,(int)stereo,0).clamps && !hall_level(0,127,127,12000,(int)stereo,0).clamps);
     }
     /* a second of full scale noise, then silence: the tail ends exactly (no limit cycle); DEPTH sets its length */
     double late[2]={0};
