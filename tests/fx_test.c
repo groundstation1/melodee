@@ -87,7 +87,7 @@ static void send_return(void)
         for(uint32_t i=0;i<CTL;i++){fx_send_l[i]=frame<20?6000:0;fx_send_r[i]=frame<20?-5000:0;}
         fx_bus_start(CTL);fx_bus_join();assert(fx_bus_result);memcpy(l,fx_left,sizeof l);memcpy(r,fx_right,sizeof r);
     }
-    assert(resource[RES_FX0+NPART*FX_SLOTS].size==4096 && !fx_state[NPART*FX_SLOTS].failed);
+    assert(resource[RES_FX0+NPART*FX_SLOTS].size==FX_HALL_BYTES && !fx_state[NPART*FX_SLOTS].failed);
     uint64_t energy=0;for(uint32_t i=0;i<CTL;i++)energy+=abs(l[i])+abs(r[i]);assert(energy>10);
     song.g[G_MFXTYPE]=FX_ECHO;song.g[G_MFX2TYPE]=FX_REVERB;song.g[G_MFX3TYPE]=FX_ROOM;
     for(uint32_t frame=0;frame<64;frame++){fx_bus_start(CTL);fx_bus_join();for(uint32_t j=0;j<3;j++)if(fx_bus_plan[j].active && fx_bus_plan[j].f->type>=FX_ECHO)assert(fx_bus_plan[j].mem==resource[RES_FX0+NPART*FX_SLOTS+j].ptr);}
@@ -109,7 +109,7 @@ static void send_return(void)
     song.g[G_MFXTYPE]=FX_REVERB;for(uint32_t k=0;k<16;k++){fx_bus_start(CTL);fx_bus_join();master_samples(out,CTL);}assert(fx_bus_mix==32768);
     song.g[G_MFXTYPE]=FX_ECHO;fx_bus_start(CTL);fx_bus_join();assert(!fx_bus_target);master_samples(out,CTL);assert(fx_bus_mix==32768-CTL*128);
     song.g[G_FXRETURN]=0;for(uint32_t k=0;k<24;k++){fx_bus_start(CTL);fx_bus_join();master_samples(out,CTL);}assert(!fx_bus_mix);
-    puts("Shared send/return: post-fader sum, no dry doubling when OFF, one 4KiB tank, preset independence, UI and project/template persistence: OK");
+    puts("Shared send/return: post-fader sum, no dry doubling when OFF, one 12 KiB tank, preset independence, UI and project/template persistence: OK");
 }
 static void separate_sends(void)
 {
@@ -637,6 +637,154 @@ static void boom_test(void)
     puts("No boom: ECHO, ROOM and REVERB keep their bass under their mids, no low note ringing over them: OK");
     puts("Not harsh, not thin: their highs under the mids, no high note ringing over them, the bass within 15 dB: OK");
 }
+/* REVERB in the shared rack (fx_hall): the same levels as the inserts' (space_levels) from the send, both sides fed,
+ * exact silence after its tail, DEPTH's decay, a one-sided source reaching both outputs, the polyphase FIR's image
+ * rejection and, measured on 1/3-octave noise (single sines scatter by +/-7 dB over its long decays' modes), no boom,
+ * not thin and not harsh. */
+static void hall_bus(int rate,int cha,int mix)
+{
+    reset_fx();memset(fx_send_l,0,sizeof fx_send_l);memset(fx_send_r,0,sizeof fx_send_r);
+    for(uint32_t slot=0;slot<FX_SLOTS;slot++){uint32_t b=G_MFXTYPE+slot*FX_PARAMS;song.g[b]=song.g[b+1]=song.g[b+2]=song.g[b+3]=0;song.g[G_MFXTONE+slot]=0;}
+    song.g[G_MFXTYPE]=FX_REVERB;song.g[G_MFXMIX]=(int16_t)mix;song.g[G_MFXRATE]=(int16_t)rate;song.g[G_MFXCHAR]=(int16_t)cha;
+    song.g[G_FXMODE]=0;song.g[G_FXRETURN]=127;fx_bus_mix=0;fx_bus_select();
+    fx_bus_start(CTL);fx_bus_join();fx_state[NPART*FX_SLOTS].mix=(mix+(mix==127))*256;
+}
+static uint32_t hall_clamps(void)
+{
+    const int16_t *mem=resource[RES_FX0+NPART*FX_SLOTS].ptr;uint32_t n=0;
+    assert(resource[RES_FX0+NPART*FX_SLOTS].size==FX_HALL_BYTES);
+    for(uint32_t k=sizeof(fx_hall_t)/2u;k<sizeof(fx_hall_t)/2u+FX_HALL_SAMPLES;k++)if(mem[k]>=32767 || mem[k]<=-32767)n++;
+    return n;
+}
+/* one block through the shared chain: the send in, the bus output (fully wet at MIX 127) out */
+static void hall_block(const int32_t *l,const int32_t *r)
+{
+    memcpy(fx_send_l,l,sizeof fx_send_l);memcpy(fx_send_r,r,sizeof fx_send_r);
+    fx_bus_start(CTL);fx_bus_join();assert(fx_bus_result);
+}
+static fx_level_t hall_level(int rate,int cha,int mix,double rms,int stereo)
+{
+    hall_bus(rate,cha,mix);
+    int32_t rng[2]={12345,777},l[CTL],r[CTL];double hp[2]={0},lp1[2]={0},lp2[2]={0};fx_level_t res={0};
+    const double a=1-exp(-6.283185307*100.0/FS),c=1-exp(-6.283185307*1500.0/FS);
+    for(uint32_t frame=0;frame<4u*FS/CTL;frame++){
+        for(uint32_t i=0;i<CTL;i++)for(uint32_t ch=0;ch<2u;ch++){
+            double w=(int32_t)noise32(&rng[ch])/2147483648.0*1.7320508;
+            hp[ch]+=(w-hp[ch])*a;lp1[ch]+=(w-hp[ch]-lp1[ch])*c;lp2[ch]+=(lp1[ch]-lp2[ch])*c;
+            (ch?r:l)[i]=clamp((int32_t)lrint(lp2[ch]*3.2*rms),-65536,65536);
+        }
+        if(!stereo)memcpy(r,l,sizeof r);
+        hall_block(l,r);res.clamps+=hall_clamps();
+        if(frame>=2u*FS/CTL)for(uint32_t i=0;i<CTL;i++){
+            res.dry+=((double)l[i]*l[i]+(double)r[i]*r[i])/2;res.out+=((double)fx_left[i]*fx_left[i]+(double)fx_right[i]*fx_right[i])/2;
+            if(abs(fx_left[i])>res.peak)res.peak=abs(fx_left[i]);if(abs(fx_right[i])>res.peak)res.peak=abs(fx_right[i]);
+        }
+    }
+    return res;
+}
+/* the wet return of a 1/3-octave noise band around hz (RMS ~2000) over its input, steady from 0.5 to 1.5 s */
+static double hall_band(int rate,int cha,double hz)
+{
+    hall_bus(rate,cha,127);
+    double w0=6.283185307*hz/FS,al=sin(w0)*sinh(0.3465735903*0.3333333*w0/sin(w0)),b0=al/(1+al),a1=-2*cos(w0)/(1+al),a2=(1-al)/(1+al);
+    double x1=0,x2=0,y1=0,y2=0,e=0,in=0;int32_t rng=99,l[CTL];
+    for(uint32_t frame=0;frame<FS*3u/2u/CTL;frame++){
+        for(uint32_t i=0;i<CTL;i++){
+            double x=(int32_t)noise32(&rng)/2147483648.0*1.7320508,y=b0*x-b0*x2-a1*y1-a2*y2;
+            x2=x1;x1=x;y2=y1;y1=y;l[i]=(int32_t)lrint(y*2000.0*2.6);
+        }
+        hall_block(l,l);
+        if(frame>=FS/2u/CTL)for(uint32_t i=0;i<CTL;i++){e+=(double)fx_left[i]*fx_left[i]+(double)fx_right[i]*fx_right[i];in+=2.0*l[i]*l[i];}
+    }
+    return e/in;
+}
+static double goertzel(const int32_t *x,uint32_t n,double hz)
+{
+    double c=2*cos(6.283185307*hz/FS),s1=0,s2=0;
+    for(uint32_t i=0;i<n;i++){double s=x[i]+c*s1-s2;s2=s1;s1=s;}
+    return s1*s1+s2*s2-c*s1*s2;
+}
+static void hall_test(void)
+{
+    uint32_t lines=0,diffusers=0;
+    for(uint32_t k=0;k<8u;k++)lines+=HALL_LEN[k]+FX_HALL_SLACK;
+    for(uint32_t k=0;k<12u;k++)diffusers+=HALL_AP_LEN[k];
+    assert(lines==FX_HALL_LINES && diffusers==FX_HALL_DIFFUSERS);
+    /* the inserts keep the FS/8 tank and its 4 KiB */
+    reset_fx();trk[0].p[P_FXTYPE]=FX_REVERB;trk[0].p[P_FXMIX]=127;int32_t b[CTL]={0};
+    assert(fx_process(&trk[0],b,CTL) && resource[RES_FX0].size==FX_REVERB_BYTES);
+    for(uint32_t stereo=0;stereo<2u;stereo++){
+        double lo=99,hi=-99,lo50=99,hi50=-99;
+        for(int rate=0;rate<=127;rate+=rate?63:64)for(int cha=0;cha<=127;cha+=cha?63:64){
+            fx_level_t w=hall_level(rate,cha,127,4000,(int)stereo),h=hall_level(rate,cha,64,4000,(int)stereo);
+            double wet=10*log10(w.out/w.dry),half=10*log10(h.out/h.dry);
+            printf("shared REVERB (%s) SIZE %3d DEPTH %3d: wet %+.1f dB, MIX 50 %% %+.1f dB\n",stereo?"stereo":"mono",rate,cha,wet,half);
+            assert(!w.clamps && !h.clamps && w.peak<=65536 && h.peak<=65536);
+            if(wet<lo)lo=wet;if(wet>hi)hi=wet;if(half<lo50)lo50=half;if(half>hi50)hi50=half;
+        }
+        assert(lo>-1.0 && hi<3.5 && hi-lo<4.0 && lo50>-3.25 && hi50<3.0);
+        assert(!hall_level(127,127,127,12000,(int)stereo).clamps && !hall_level(0,127,127,12000,(int)stereo).clamps);
+    }
+    /* a second of full scale noise, then silence: the tail ends exactly (no limit cycle); DEPTH sets its length */
+    double late[2]={0};
+    for(int rate=0;rate<=127;rate+=127)for(int cha=0;cha<=127;cha+=127){
+        hall_bus(rate,cha,127);int32_t rng=3,l[CTL],r[CTL];double tail=0;
+        for(uint32_t frame=0;frame<14u*FS/CTL;frame++){
+            for(uint32_t i=0;i<CTL;i++){
+                l[i]=frame<FS/CTL?(int32_t)(noise32(&rng)>>15)-65536:0;r[i]=frame<FS/CTL?(int32_t)(noise32(&rng)>>15)-65536:0;
+            }
+            hall_block(l,r);
+            for(uint32_t i=0;i<CTL;i++){
+                assert(abs(fx_left[i])<=100000 && abs(fx_right[i])<=100000);
+                if(frame>=FS/CTL+FS/CTL/2u && frame<FS/CTL*2u)tail+=(double)fx_left[i]*fx_left[i];
+                if(frame>12u*FS/CTL)assert(!fx_left[i] && !fx_right[i]);
+            }
+        }
+        if(rate==127)late[cha==127]=tail;
+    }
+    assert(late[1]>late[0]*100.0);
+    /* left only: the right output hears it in the first 80 ms, 5..15 dB down; the tails are decorrelated */
+    {
+        hall_bus(100,100,127);int32_t rng=5,l[CTL],r[CTL]={0};double el=0,er=0,lr=0,ll=0,rr=0;
+        for(uint32_t frame=0;frame<FS/CTL;frame++){
+            for(uint32_t i=0;i<CTL;i++)l[i]=frame<FS/50u/CTL?(int32_t)(noise32(&rng)>>17)-16384:0;
+            hall_block(l,r);
+            for(uint32_t i=0;i<CTL;i++){
+                double a=fx_left[i],c=fx_right[i];
+                if(frame<FS*8u/100u/CTL){el+=a*a;er+=c*c;}
+                else if(frame>FS/10u/CTL){lr+=a*c;ll+=a*a;rr+=c*c;}
+            }
+        }
+        double side=10*log10(er/el),corr=lr/sqrt(ll*rr);
+        printf("shared REVERB: a left source's right early %+.1f dB, the tails' correlation %+.2f\n",side,corr);
+        assert(side>-15.0 && side<-5.0 && corr<0.3 && corr>-0.3);
+    }
+    /* images: a 3 kHz tone's FS/4 images (8025, 14025 Hz) 30 dB or more under it (linear interpolation: ~10 dB) */
+    {
+        hall_bus(60,64,127);int32_t l[CTL],out[FS/2];uint32_t phase=0,inc=(uint32_t)(3000.0*4294967296.0/FS),at=0;
+        for(uint32_t frame=0;frame<FS/CTL;frame++){
+            for(uint32_t i=0;i<CTL;i++){phase+=inc;l[i]=8000*sine_i(phase)/32768;}
+            hall_block(l,l);
+            for(uint32_t i=0;i<CTL && frame>=FS/2u/CTL;i++)if(at<FS/2u)out[at++]=fx_left[i];
+        }
+        double tone=goertzel(out,at,3000),image=goertzel(out,at,8025)+goertzel(out,at,14025);
+        printf("shared REVERB: 3 kHz images %+.1f dB\n",10*log10(image/tone));
+        assert(image<tone/1000.0);
+    }
+    /* No boom, not thin, not harsh (boom_test's bounds on noise bands): 50..100 Hz 3..15 dB under 400 Hz..1 kHz,
+     * 1.25..2.5 kHz no louder than it, and no band ringing 3 dB over the loudest mid one */
+    static const int band_rate[]={60,100,127},band_cha[]={60,110,127};
+    static const double low_hz[]={50,63,80,100},mid_hz[]={400,500,630,800,1000},high_hz[]={1250,1600,2000,2500};
+    for(uint32_t s=0;s<3u;s++){
+        double low=0,low_peak=0,mid=0,mid_peak=0,high=0,high_peak=0;
+        for(uint32_t k=0;k<4u;k++){double e=hall_band(band_rate[s],band_cha[s],low_hz[k]);low+=e/4;if(e>low_peak)low_peak=e;}
+        for(uint32_t k=0;k<5u;k++){double e=hall_band(band_rate[s],band_cha[s],mid_hz[k]);mid+=e/5;if(e>mid_peak)mid_peak=e;}
+        for(uint32_t k=0;k<4u;k++){double e=hall_band(band_rate[s],band_cha[s],high_hz[k]);high+=e/4;if(e>high_peak)high_peak=e;}
+        printf("shared REVERB SIZE %d DEPTH %d: lows %+.1f dB, highs %+.1f dB under the mids\n",band_rate[s],band_cha[s],10*log10(low/mid),10*log10(high/mid));
+        assert(low<mid/2.0 && low>mid/32.0 && low_peak<mid_peak*2.0 && high<mid && high_peak<mid_peak*2.0);
+    }
+    puts("Shared REVERB: insert levels from the send, both sides, exact silence after the tail, DEPTH's decay, stereo spread, FIR images, no boom / thin / harsh: OK");
+}
 /* README "FX rack": FX opens the track's rack (MOD's rows: K2 the row, K1 its effect, K4 its amount), OCT+ opens a
  * row (an empty slot: its effects' list; the shared row: SHARED), OCT- goes back up, a slot's page shows while it holds
  * an effect and is named after it */
@@ -680,7 +828,7 @@ static void rack_test(void)
 }
 int main(int argc,char **argv)
 {
-    legacy();frozen_three_slots();send_return();separate_sends();fx_chain_test();reverb_tail();reverb_presence();reverb_rate_conversion();space_levels();rate_and_pan();tape_smooth();chorus_test();tone_test();boom_test();rack_test();
+    legacy();frozen_three_slots();send_return();separate_sends();fx_chain_test();reverb_tail();reverb_presence();reverb_rate_conversion();space_levels();rate_and_pan();tape_smooth();chorus_test();tone_test();boom_test();hall_test();rack_test();
     uint64_t dry=fx_signal(FX_OFF,60,64,0,0);
     for(uint32_t mode=FX_PHASER;mode<FX_COUNT;mode++){
         assert(fx_signal(mode,60,64,0,0)==dry);

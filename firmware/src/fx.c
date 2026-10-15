@@ -446,6 +446,166 @@ static __attribute__((noinline,section(".dsp_text"))) void fx_reverb(fx_state_t 
     }
     f->mix=mix;f->decim=(uint8_t)phase;f->rev_input=a;f->rev_input2=b;f->echo=previous;f->damp[0]=difference;f->damp[1]=low;
 }
+/* REVERB in the shared rack: eight lines at FS/4 (a ~5 kHz bandwidth) and 31..72 ms
+ * long, mixed by a full 8 x 8 Hadamard on every round trip, fed and read in stereo
+ * (left on the even lines, right on the odd ones, four diffusers each). Each line's
+ * decay depends on frequency: a one-pole damping set from the decay ratio (Jot),
+ * and a low shelf instead of the inserts' ~55 Hz round trip cut, which thinned the
+ * bass. Both rate conversions are one 32-tap polyphase FIR (4.7 kHz, Kaiser 5):
+ * images and aliases sit 44 dB or more under a tone, where the inserts' linear
+ * interpolation leaves 9..25 dB (and more than the tone itself at 3 kHz).
+ * The state and all delays share one 12 KiB allocation; the gain staging is the
+ * inserts' (input by sqrt(1 - c g^2), a fixed make-up). Per-track inserts keep the
+ * cheaper FS/8 tank above unless MELODEE_FX_HALL_INSERTS. */
+#ifndef MELODEE_FX_HALL_INSERTS
+#define MELODEE_FX_HALL_INSERTS 0
+#endif
+#define FX_HALL_DIV 4u
+#define FX_HALL_TAPS 8u                          /* per polyphase branch */
+#define FX_HALL_FIR (FX_HALL_DIV*FX_HALL_TAPS)
+#define FX_HALL_SLACK 10u                        /* past the longest span: the drift's +/-8 samples */
+#define FX_HALL_LINES (4502u+8u*FX_HALL_SLACK)  /* HALL_LEN's sum and the slack */
+#define FX_HALL_DIFFUSERS 922u                   /* HALL_AP_LEN's sum */
+#define FX_HALL_SAMPLES (FX_HALL_LINES+FX_HALL_DIFFUSERS)
+#define FX_HALL_BYTES 12288u
+#define FX_HALL_LEVEL 640                        /* the wet make-up gain, /256 */
+#define FX_HALL_LOSS 0.98f                       /* the power a round trip's drifting read loses */
+#define FX_HALL_BASS 0.25f                       /* the low shelf's decay time over the mids' */
+#define FX_HALL_COS 0.94210f                     /* cos, sin of 600 Hz at FS / 4 */
+#define FX_HALL_SIN 0.33531f
+static const float HALL_FIR[FX_HALL_FIR] __attribute__((section(".data.fx_lengths")))={
+    -0.00061433f,-0.00044034f,0.00103240f,0.00382487f,0.00653834f,0.00648258f,0.00104150f,-0.01011839f,
+    -0.02322184f,-0.03040146f,-0.02229807f,0.00745549f,0.05793695f,0.11928107f,0.17510237f,0.20839887f,
+    0.20839887f,0.17510237f,0.11928107f,0.05793695f,0.00745549f,-0.02229807f,-0.03040146f,-0.02322184f,
+    -0.01011839f,0.00104150f,0.00648258f,0.00653834f,0.00382487f,0.00103240f,-0.00044034f,-0.00061433f};
+static const uint16_t HALL_LEN[8] __attribute__((section(".data.fx_lengths")))={347,397,457,523,593,661,727,797};
+static const uint16_t HALL_AP_LEN[12] __attribute__((section(".data.fx_lengths")))={41,59,89,127,43,61,83,131,47,67,73,101};
+typedef struct {
+    float in[2][2u*FX_HALL_FIR];                 /* the decimator's rings, each written twice: one straight window */
+    float out[2][2u*FX_HALL_TAPS];               /* the interpolator's tank-rate histories, the same */
+    int32_t damp[8],bass[8],gain[8],high[8],low[8],norm;
+    uint16_t pos[8],span[8],ap[12];
+    uint8_t ring,hist,phase,ready;
+    int16_t rate,cha;
+} fx_hall_t;
+_Static_assert(sizeof(fx_hall_t)+2u*FX_HALL_SAMPLES<=FX_HALL_BYTES,"REVERB's shared tank fits its allocation");
+static int fx_hall_slot(const fx_state_t *f){return MELODEE_FX_HALL_INSERTS || (uint32_t)(f-fx_state)>=NPART*FX_SLOTS;}
+static void fx_hall_setup(fx_hall_t *h,int32_t rate,int32_t cha)
+{
+    if(h->ready && h->rate==rate && h->cha==cha)return;
+    h->ready=1;h->rate=(int16_t)rate;h->cha=(int16_t)cha;
+    float decay=300.0f+(float)(cha*cha)*(5700.0f/(127.0f*127.0f)),loss=0;
+    /* The highs' decay time over the mids': 0.25 at DEPTH 0, 0.6 at 127 (Jot: a pole
+     * of x/4 (1/ratio^2 - 1) for a line of loss x). The low shelf decays at FX_HALL_BASS. */
+    float bright=0.25f+0.35f*(float)cha/127.0f,high=1.0f/(bright*bright)-1.0f,low=1.0f/FX_HALL_BASS-1.0f;
+    /* A short decay damps its highs anyway: hold the longest line's pole at 0.6. */
+    float longest=6.907755f*(float)HALL_LEN[7]*(64u+(uint32_t)rate)/191.0f*(1000.0f*FX_HALL_DIV)/((float)FS*decay);
+    if(high*longest>2.4f)high=2.4f/longest;
+    for(uint32_t k=0;k<8u;k++){
+        h->span[k]=(uint16_t)((uint32_t)HALL_LEN[k]*(64u+(uint32_t)rate)/191u);
+        float x=6.907755f*(float)h->span[k]*(1000.0f*FX_HALL_DIV)/((float)FS*decay);
+        float g=(1.0f-x*0.5f)/(1.0f+x*0.5f),p=x*0.25f*high,y=x*low;
+        h->gain[k]=(int32_t)(65536.0f*0.35355339f*g); /* the Hadamard's 1 / sqrt 8 */
+        h->high[k]=(int32_t)(65536.0f*p);
+        float shelf=1.0f-1.0f/(1.0f+y+y*y*0.5f); /* e^-y, positive (a Q16 coefficient over 1 would overflow) */
+        h->low[k]=(int32_t)(65536.0f*shelf);
+        /* The round trip's gain at 600 Hz, where a track's energy is: g, the damping pole's
+         * (1 - p) / |1 - p e^-jw| and the shelf's |1 - s / 16 / (1 - 15/16 e^-jw)|. */
+        float dr=1.0f-0.9375f*FX_HALL_COS,di=0.9375f*FX_HALL_SIN,d=0.0625f*shelf/(dr*dr+di*di);
+        float sr=1.0f-d*dr,si=d*di,e=g*g*(1.0f-p)*(1.0f-p)/(1.0f-2.0f*p*FX_HALL_COS+p*p)*(sr*sr+si*si);
+        loss+=(1.0f-FX_HALL_LOSS*e)*0.125f;
+    }
+    float root=1.0f;for(uint32_t k=0;k<6u;k++)root=0.5f*(root+loss/root);
+    h->norm=(int32_t)(65536.0f*root);
+}
+static inline __attribute__((always_inline)) int32_t fx_hall_ap(uint16_t *at,uint32_t len,int16_t *mem,int32_t x)
+{
+    uint32_t pos=*at;int32_t delayed=mem[pos];
+    int32_t y=delayed-fx_reverb_mul(x,42598u); /* g = 0.65 */
+    mem[pos]=(int16_t)clamp(x+fx_reverb_mul(y,42598u),-32767,32767);
+    if(++pos>=len)pos=0;*at=(uint16_t)pos;
+    return y;
+}
+#define FX_HALL_BF(a,b) {int32_t t=v[a];v[a]=t+v[b];v[b]=t-v[b];}
+static __attribute__((noinline,section(".audio_text"))) void fx_hall(fx_state_t *restrict f,int16_t *restrict mem,uint32_t n,const int32_t *drift,int32_t target)
+{
+    fx_hall_t *h=(fx_hall_t *)(void *)mem;int16_t *line=(int16_t *)(void *)(h+1);
+    uint32_t phase=h->phase,ring=h->ring,hist=h->hist;int32_t mix=f->mix;
+    const float slew=FX_HALL_DIV/(0.010f*FS);
+    for(uint32_t i=0;i<n;i++){
+        h->in[0][ring]=h->in[0][ring+FX_HALL_FIR]=(float)fx_left[i];
+        h->in[1][ring]=h->in[1][ring+FX_HALL_FIR]=(float)fx_right[i];
+        ring=(ring+1u)&(FX_HALL_FIR-1u);
+        if(!phase){
+            /* Decimate: the symmetric FIR folds to 16 products a side. Then TONE (its
+             * coefficients slew once, both sides keep their histories) and the diffusers. */
+            float s[2];
+            for(uint32_t ch=0;ch<2u;ch++){
+                const float *w=h->in[ch]+ring;float a=0;
+                for(uint32_t t=0;t<FX_HALL_FIR/2u;t++)a+=HALL_FIR[t]*(w[t]+w[FX_HALL_FIR-1u-t]);
+                s[ch]=a;
+            }
+            for(uint32_t k=0;k<2u;k++){
+                fx_bq_t *q=&f->q[0][k];float enabled=q->a2>0?1.0f:0.0f;
+                if(!enabled && q->b1<0.000001f){q->b0=q->b1=q->z1=f->q[1][k].z1=0;continue;}
+                q->b0+=(q->a1-q->b0)*slew;q->b1+=(enabled-q->b1)*slew;
+                for(uint32_t ch=0;ch<2u;ch++){
+                    float *z=&f->q[ch][k].z1,v=(s[ch]-*z)*q->b0,low=v+*z;*z=low+v;
+                    if(*z>-1e-9f && *z<1e-9f)*z=0;
+                    s[ch]=k?s[ch]+(low-s[ch])*q->b1:s[ch]-low*q->b1;
+                }
+            }
+            int32_t x[2];uint32_t off=FX_HALL_LINES;
+            for(uint32_t ch=0;ch<2u;ch++){
+                int32_t y=fx_reverb_mul(clamp(fx_div_pow2((int32_t)s[ch],1),-32000,32000),(uint32_t)h->norm);
+                for(uint32_t k=ch*4u;k<ch*4u+4u;k++){y=fx_hall_ap(&h->ap[k],HALL_AP_LEN[k],line+off,y);off+=HALL_AP_LEN[k];}
+                x[ch]=y;
+            }
+            int32_t v[8];uint32_t at=0;
+            for(uint32_t k=0;k<8u;k++){
+                uint32_t len=HALL_LEN[k]+FX_HALL_SLACK,pos=h->pos[k];
+                int32_t read=(int32_t)(pos+len-h->span[k])-(drift[k]>>10);
+                if(read<0)read+=(int32_t)len;else if(read>=(int32_t)len)read-=(int32_t)len;
+                uint32_t prev=read?(uint32_t)read-1u:len-1u;
+                int32_t y=line[at+(uint32_t)read];
+                y=y*256+fx_div_pow2((line[at+prev]-y)*(drift[k]&1023),2);
+                /* The filters keep eight fraction bits (their rounding is no round trip loss):
+                 * the low shelf (~115 Hz) decays the bass, and DC with it, in FX_HALL_BASS of the
+                 * mids' time; the damping pole sets the highs'. Only the line writes truncate. */
+                h->bass[k]=fx_div_pow2(15*h->bass[k]+y,4);y-=fx_reverb_mul(h->bass[k],(uint32_t)h->low[k]);
+                h->damp[k]+=fx_reverb_mul(y-h->damp[k],65536u-(uint32_t)h->high[k]);
+                v[k]=fx_div_pow2(h->damp[k],8);at+=len;
+            }
+            int32_t l=fx_div_pow2(v[0]-v[2]+v[4]-v[6],1),r=fx_div_pow2(v[1]-v[3]+v[5]-v[7],1);
+            FX_HALL_BF(0,1)FX_HALL_BF(2,3)FX_HALL_BF(4,5)FX_HALL_BF(6,7)
+            FX_HALL_BF(0,2)FX_HALL_BF(1,3)FX_HALL_BF(4,6)FX_HALL_BF(5,7)
+            FX_HALL_BF(0,4)FX_HALL_BF(1,5)FX_HALL_BF(2,6)FX_HALL_BF(3,7)
+            /* Each side feeds its own lines and 3/8 of it the other side's: a source on one
+             * side reaches both outputs in the first reflections. */
+            int32_t cross[2]={x[0]+fx_div_pow2(3*x[1],3),x[1]+fx_div_pow2(3*x[0],3)};
+            at=0;
+            for(uint32_t k=0;k<8u;k++){
+                uint32_t len=HALL_LEN[k]+FX_HALL_SLACK;int32_t in=cross[k&1u];
+                line[at+h->pos[k]]=(int16_t)clamp(fx_reverb_mul(v[k],(uint32_t)h->gain[k])+((k&2u)?-in:in),-32767,32767);
+                if(++h->pos[k]>=len)h->pos[k]=0;at+=len;
+            }
+            l=fx_hall_ap(&h->ap[8],HALL_AP_LEN[8],line+off,l);off+=HALL_AP_LEN[8];
+            l=fx_hall_ap(&h->ap[9],HALL_AP_LEN[9],line+off,l);off+=HALL_AP_LEN[9];
+            r=fx_hall_ap(&h->ap[10],HALL_AP_LEN[10],line+off,r);off+=HALL_AP_LEN[10];
+            r=fx_hall_ap(&h->ap[11],HALL_AP_LEN[11],line+off,r);
+            h->out[0][hist]=h->out[0][hist+FX_HALL_TAPS]=(float)(softclip(fx_div_pow2(l*FX_HALL_LEVEL,9))*2);
+            h->out[1][hist]=h->out[1][hist+FX_HALL_TAPS]=(float)(softclip(fx_div_pow2(r*FX_HALL_LEVEL,9))*2);
+            hist=(hist+1u)&(FX_HALL_TAPS-1u);
+        }
+        /* Interpolate: this sample's branch of the same FIR over the last eight tank outputs. */
+        const float *c=HALL_FIR+phase,*yl=h->out[0]+hist+FX_HALL_TAPS-1u,*yr=h->out[1]+hist+FX_HALL_TAPS-1u;
+        float l=0,r=0;
+        for(uint32_t j=0;j<FX_HALL_TAPS;j++){l+=c[j*FX_HALL_DIV]*yl[-(int32_t)j];r+=c[j*FX_HALL_DIV]*yr[-(int32_t)j];}
+        fx_return(target,0,0,i,(int32_t)(l*FX_HALL_DIV),(int32_t)(r*FX_HALL_DIV),&mix);
+        phase=(phase+1u)&(FX_HALL_DIV-1u);
+    }
+    h->phase=(uint8_t)phase;h->ring=(uint8_t)ring;h->hist=(uint8_t)hist;f->mix=mix;
+}
 /* The filter inserts use a quarter-rate triangular decimator and pole,
  * independently per stereo side. Their Reverb histories are idle.
  * At most ceil(CTL/4) wet samples are staged; the dry audio stays at FS. */
@@ -582,7 +742,7 @@ static void fx_slot_prepare(fx_plan_t *plan,uint32_t si,const int16_t *p)
     }
     f->rate=(int16_t)clamp(p[2],0,127);f->character=(int16_t)clamp(p[3],0,127);
     if(fx_has_tone(f->type)){   /* the low cut (section 0: the floor, TONE above 0 higher), TONE below 0 the high cut (1) */
-        uint32_t slot=si%FX_SLOTS,master=si/FX_SLOTS==NPART,div=f->type==FX_REVERB?FX_REV_DIV:4u;
+        uint32_t slot=si%FX_SLOTS,master=si/FX_SLOTS==NPART,div=f->type==FX_REVERB && !fx_hall_slot(f)?FX_REV_DIV:4u;
         int32_t tone=clamp(master?song.g[G_MFXTONE+slot]:trk[si/FX_SLOTS].p[P_FXTONE+slot],-FX_TONE_MAX,FX_TONE_MAX);
         for(uint32_t k=0;k<2u;k++){   /* (a2: the cutoff now, Hz; 0 off) */
             int32_t hz=k?(tone<0?fx_tone_hz(tone):0):fx_low_cut_hz(f->type,tone);
@@ -598,7 +758,7 @@ static void fx_slot_prepare(fx_plan_t *plan,uint32_t si,const int16_t *p)
 #endif
     int16_t *mem=0;
     if(f->type>=FX_ECHO){
-        uint32_t bytes=f->type==FX_CHORUS?FX_CHORUS_BYTES:f->type==FX_ROOM?2048u:f->type==FX_REVERB?FX_REVERB_BYTES:8192u;
+        uint32_t bytes=f->type==FX_CHORUS?FX_CHORUS_BYTES:f->type==FX_ROOM?2048u:f->type==FX_REVERB?(fx_hall_slot(f)?FX_HALL_BYTES:FX_REVERB_BYTES):8192u;
         if(!f->failed && !resource[RES_FX0+si].size){
             void *(*volatile allocate)(uint32_t,uint32_t)=fx_memory;mem=allocate(RES_FX0+si,bytes);if(!mem)f->failed=1;
         }else if(resource[RES_FX0+si].size)mem=resource[RES_FX0+si].ptr;
@@ -621,9 +781,16 @@ static __attribute__((noinline,section(".audio_text"))) int fx_slot_run(const fx
     }else if(f->type==FX_REVERB){
         /* Design the slow drift beside the other block-rate coefficients,
          * keeping sine lookup calls outside the small SRAM sample kernel. */
-        int32_t drift[8];for(uint32_t k=0;k<8u;k++)drift[k]=fx_sine(f->phase*(k+1u)+k*0x23456789u)*f->character/1024;
-        f->phase+=n*11380u;void (*volatile setup)(fx_state_t *)=fx_reverb_setup;setup(f);
-        void (*volatile run)(fx_state_t *,int16_t *,uint32_t,const int32_t *,int32_t)=fx_reverb;run(f,mem,n,drift,target);
+        int32_t drift[8],hall=fx_hall_slot(f);  /* the same drift in ms: twice the samples at FS/4 */
+        for(uint32_t k=0;k<8u;k++)drift[k]=fx_sine(f->phase*(k+1u)+k*0x23456789u)*f->character/(hall?512:1024);
+        f->phase+=n*11380u;
+        if(hall){
+            void (*volatile setup)(fx_hall_t *,int32_t,int32_t)=fx_hall_setup;setup((fx_hall_t *)(void *)mem,f->rate,f->character);
+            void (*volatile run)(fx_state_t *,int16_t *,uint32_t,const int32_t *,int32_t)=fx_hall;run(f,mem,n,drift,target);
+        }else{
+            void (*volatile setup)(fx_state_t *)=fx_reverb_setup;setup(f);
+            void (*volatile run)(fx_state_t *,int16_t *,uint32_t,const int32_t *,int32_t)=fx_reverb;run(f,mem,n,drift,target);
+        }
     }else if(f->type>=FX_ECHO){void (*volatile run)(fx_state_t *,int16_t *,uint32_t,int32_t)=fx_time;run(f,mem,n,target);}
     else {
         if(f->type==FX_TAPE){void (*volatile design)(fx_state_t *,uint32_t)=fx_tape_design;design(f,n);}
