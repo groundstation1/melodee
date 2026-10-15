@@ -308,22 +308,26 @@ static void reverb_rate_conversion(void)
     assert(energy[0]>100000000u && energy[1]<energy[0]/60u && energy[2]<100000u);
     puts("Reverb rate conversion: exact FIR reference through integrator wraps, preserved mids and alias-band rejection: OK");
 }
-/* ROOM / REVERB levels: band noise (100 Hz-1.5 kHz, a track's typical RMS 4000, peaks ~16000) through an insert, over
- * a SIZE x DEPTH grid. Fully wet stays within 2 dB of one level near the dry one (it was -13 dB for ROOM and -7..+5 dB
- * for REVERB), MIX 50 % keeps the loudness within 3 dB of dry, and no comb / tank / diffuser write is clamped and
- * REVERB's soft limit stays out of its curve (at most half its range) at that level; hot noise (RMS 12000) clamps nothing. */
+/* ROOM / REVERB levels through an insert over a SIZE x DEPTH grid, at a track's typical RMS 4000: band noise (100 Hz-
+ * 1.5 kHz, peaks ~16000) and a sustained pad (a detuned A minor triad of saws, 2 kHz low pass). Fully wet sits 1-4 dB under
+ * dry on noise and within 1.5 dB of one level (before: -13 dB for ROOM, -7..+5 dB for REVERB); a pad never comes back more
+ * than 2.5 dB over dry (before: up to +8 dB, at the biggest SIZE a drifting read wrapped into a few-sample loop). MIX 50 %
+ * stays 2.5-4.75 dB under dry (an equal-power dip of uncorrelated wet), no comb / tank / diffuser write is clamped, REVERB's
+ * soft limit stays out of its curve (at most half its range), and hot noise (RMS 12000) clamps nothing. */
 typedef struct { double dry, out; int32_t peak; uint32_t clamps; } fx_level_t;
-static fx_level_t fx_level(uint32_t type,int rate,int cha,int mix,double rms)
+static fx_level_t fx_level(uint32_t type,int rate,int cha,int mix,double rms,int pad)
 {
     reset_fx();track_t *t=&trk[0];
     t->p[P_FXTYPE]=(int16_t)type;t->p[P_FXMIX]=(int16_t)mix;t->p[P_FXRATE]=(int16_t)rate;t->p[P_FXCHAR]=(int16_t)cha;
-    int32_t rng=12345,b[CTL],in[CTL];double hp=0,lp1=0,lp2=0;fx_level_t r={0};
-    const double a=1-exp(-6.283185307*100.0/FS),c=1-exp(-6.283185307*1500.0/FS);
+    static const double hz[6]={220,220.9,261.6,262.5,329.6,330.8};
+    int32_t rng=12345,b[CTL],in[CTL];uint32_t ph[6]={0};double hp=0,lp1=0,lp2=0;fx_level_t r={0};
+    const double a=1-exp(-6.283185307*100.0/FS),c=1-exp(-6.283185307*1500.0/FS),d=1-exp(-6.283185307*2000.0/FS);
     for(uint32_t frame=0;frame<4u*FS/CTL;frame++){
         for(uint32_t i=0;i<CTL;i++){
-            double w=(int32_t)noise32(&rng)/2147483648.0*1.7320508;
-            hp+=(w-hp)*a;lp1+=(w-hp-lp1)*c;lp2+=(lp1-lp2)*c;
-            b[i]=in[i]=clamp((int32_t)lrint(lp2*3.2*rms),-65536,65536);
+            double x;
+            if(pad){x=0;for(uint32_t k=0;k<6;k++){ph[k]+=(uint32_t)(hz[k]*4294967296.0/FS);x+=(int32_t)ph[k]/2147483648.0;}lp1+=(x-lp1)*d;x=lp1*0.75;}
+            else{double w=(int32_t)noise32(&rng)/2147483648.0*1.7320508;hp+=(w-hp)*a;lp1+=(w-hp-lp1)*c;lp2+=(lp1-lp2)*c;x=lp2*3.2;}
+            b[i]=in[i]=clamp((int32_t)lrint(x*rms),-65536,65536);
         }
         assert(fx_process(t,b,CTL));
         const int16_t *mem=resource[RES_FX0].ptr;uint32_t words=resource[RES_FX0].size/2u;
@@ -340,16 +344,16 @@ static void space_levels(void)
     for(uint32_t type=FX_ROOM;type<=FX_REVERB;type++){
         double lo=99,hi=-99,lo50=99,hi50=-99;
         for(int rate=0;rate<=127;rate+=rate?63:64)for(int cha=0;cha<=127;cha+=cha?63:64){
-            fx_level_t w=fx_level(type,rate,cha,127,4000),h=fx_level(type,rate,cha,64,4000);
-            double wet=10*log10(w.out/w.dry),half=10*log10(h.out/h.dry);
-            printf("%s SIZE %3d DEPTH %3d: wet %+.1f dB, MIX 50 %% %+.1f dB\n",N_FX[type],rate,cha,wet,half);
-            assert(!w.clamps && !h.clamps && w.peak<=32768 && h.peak<=32768);
+            fx_level_t w=fx_level(type,rate,cha,127,4000,0),h=fx_level(type,rate,cha,64,4000,0),p=fx_level(type,rate,cha,127,4000,1);
+            double wet=10*log10(w.out/w.dry),half=10*log10(h.out/h.dry),pad=10*log10(p.out/p.dry);
+            printf("%s SIZE %3d DEPTH %3d: wet %+.1f dB, MIX 50 %% %+.1f dB, pad wet %+.1f dB\n",N_FX[type],rate,cha,wet,half,pad);
+            assert(!w.clamps && !h.clamps && !p.clamps && w.peak<=32768 && h.peak<=32768 && p.peak<=32768 && pad<2.5);
             if(wet<lo)lo=wet;if(wet>hi)hi=wet;if(half<lo50)lo50=half;if(half>hi50)hi50=half;
         }
-        assert(lo>-1.0 && hi<3.5 && hi-lo<4.0 && lo50>-3.25 && hi50<3.0);
-        assert(!fx_level(type,127,127,127,12000).clamps && !fx_level(type,0,127,127,12000).clamps);
+        assert(lo>-4.0 && hi<-0.5 && hi-lo<3.0 && lo50>-4.75 && hi50<-2.5);
+        assert(!fx_level(type,127,127,127,12000,0).clamps && !fx_level(type,0,127,127,12000,0).clamps);
     }
-    puts("ROOM / REVERB: wet level near dry and within 2 dB over SIZE x DEPTH, MIX 50 % within 3 dB, no clamped writes: OK");
+    puts("ROOM / REVERB: wet just under dry and within 1.5 dB over SIZE x DEPTH, pads never loud, MIX 50 % dip, no clamped writes: OK");
 }
 static void rate_and_pan(void)
 {
