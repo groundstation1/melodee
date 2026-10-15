@@ -2,6 +2,7 @@
  * Copyright (C) 2026 Kerem Kilic (Ellic Studio) */
 /* Real UI/mixer/storage integration plus deterministic DSP stress. */
 #include <assert.h>
+#include <math.h>
 #define UI_TEST_NO_MAIN 1
 #include "ui_test.c"
 static void reset_fx(void)
@@ -306,6 +307,49 @@ static void reverb_rate_conversion(void)
     }
     assert(energy[0]>100000000u && energy[1]<energy[0]/60u && energy[2]<100000u);
     puts("Reverb rate conversion: exact FIR reference through integrator wraps, preserved mids and alias-band rejection: OK");
+}
+/* ROOM / REVERB levels: band noise (100 Hz-1.5 kHz, a track's typical RMS 4000, peaks ~16000) through an insert, over
+ * a SIZE x DEPTH grid. Fully wet stays within 2 dB of one level near the dry one (it was -13 dB for ROOM and -7..+5 dB
+ * for REVERB), MIX 50 % keeps the loudness within 3 dB of dry, and no comb / tank / diffuser write is clamped and
+ * REVERB's soft limit stays out of its curve (at most half its range) at that level; hot noise (RMS 12000) clamps nothing. */
+typedef struct { double dry, out; int32_t peak; uint32_t clamps; } fx_level_t;
+static fx_level_t fx_level(uint32_t type,int rate,int cha,int mix,double rms)
+{
+    reset_fx();track_t *t=&trk[0];
+    t->p[P_FXTYPE]=(int16_t)type;t->p[P_FXMIX]=(int16_t)mix;t->p[P_FXRATE]=(int16_t)rate;t->p[P_FXCHAR]=(int16_t)cha;
+    int32_t rng=12345,b[CTL],in[CTL];double hp=0,lp1=0,lp2=0;fx_level_t r={0};
+    const double a=1-exp(-6.283185307*100.0/FS),c=1-exp(-6.283185307*1500.0/FS);
+    for(uint32_t frame=0;frame<4u*FS/CTL;frame++){
+        for(uint32_t i=0;i<CTL;i++){
+            double w=(int32_t)noise32(&rng)/2147483648.0*1.7320508;
+            hp+=(w-hp)*a;lp1+=(w-hp-lp1)*c;lp2+=(lp1-lp2)*c;
+            b[i]=in[i]=clamp((int32_t)lrint(lp2*3.2*rms),-65536,65536);
+        }
+        assert(fx_process(t,b,CTL));
+        const int16_t *mem=resource[RES_FX0].ptr;uint32_t words=resource[RES_FX0].size/2u;
+        for(uint32_t k=0;k<words;k++)if(mem[k]>=32767 || mem[k]<=-32767)r.clamps++;
+        if(type==FX_REVERB){int32_t p=abs(fx_state[0].rev_l)>abs(fx_state[0].rev_r)?abs(fx_state[0].rev_l):abs(fx_state[0].rev_r);if(p>r.peak)r.peak=p;}
+        if(frame>=2u*FS/CTL)for(uint32_t i=0;i<CTL;i++){
+            r.dry+=(double)in[i]*in[i];r.out+=((double)fx_left[i]*fx_left[i]+(double)fx_right[i]*fx_right[i])/2;
+        }
+    }
+    return r;
+}
+static void space_levels(void)
+{
+    for(uint32_t type=FX_ROOM;type<=FX_REVERB;type++){
+        double lo=99,hi=-99,lo50=99,hi50=-99;
+        for(int rate=0;rate<=127;rate+=rate?63:64)for(int cha=0;cha<=127;cha+=cha?63:64){
+            fx_level_t w=fx_level(type,rate,cha,127,4000),h=fx_level(type,rate,cha,64,4000);
+            double wet=10*log10(w.out/w.dry),half=10*log10(h.out/h.dry);
+            printf("%s SIZE %3d DEPTH %3d: wet %+.1f dB, MIX 50 %% %+.1f dB\n",N_FX[type],rate,cha,wet,half);
+            assert(!w.clamps && !h.clamps && w.peak<=32768 && h.peak<=32768);
+            if(wet<lo)lo=wet;if(wet>hi)hi=wet;if(half<lo50)lo50=half;if(half>hi50)hi50=half;
+        }
+        assert(lo>-1.0 && hi<3.5 && hi-lo<4.0 && lo50>-3.25 && hi50<3.0);
+        assert(!fx_level(type,127,127,127,12000).clamps && !fx_level(type,0,127,127,12000).clamps);
+    }
+    puts("ROOM / REVERB: wet level near dry and within 2 dB over SIZE x DEPTH, MIX 50 % within 3 dB, no clamped writes: OK");
 }
 static void rate_and_pan(void)
 {
@@ -630,7 +674,7 @@ static void rack_test(void)
 }
 int main(int argc,char **argv)
 {
-    legacy();frozen_three_slots();send_return();separate_sends();fx_chain_test();reverb_tail();reverb_presence();reverb_rate_conversion();rate_and_pan();tape_smooth();chorus_test();tone_test();boom_test();rack_test();
+    legacy();frozen_three_slots();send_return();separate_sends();fx_chain_test();reverb_tail();reverb_presence();reverb_rate_conversion();space_levels();rate_and_pan();tape_smooth();chorus_test();tone_test();boom_test();rack_test();
     uint64_t dry=fx_signal(FX_OFF,60,64,0,0);
     for(uint32_t mode=FX_PHASER;mode<FX_COUNT;mode++){
         assert(fx_signal(mode,60,64,0,0)==dry);
