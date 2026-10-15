@@ -324,7 +324,7 @@ static __attribute__((noinline,section(".audio_text"))) void fx_chorus(fx_state_
 static const uint16_t REV_LEN[8] __attribute__((section(".data.fx_lengths")))={131,149,167,191,211,233,251,277};
 static const uint16_t REV_AP_LEN[8] __attribute__((section(".data.fx_lengths")))={23,31,43,61,19,29,37,47};
 #define FX_REVERB_BYTES 4096u
-#define FX_REV_LEVEL 1840                        /* the wet make-up gain, /256 */
+#define FX_REV_LEVEL 920                         /* the wet make-up gain, /256 */
 /* fx_reverb_setup keeps the input's normalisation (Q16) in the idle ROOM history damp[3]. */
 static void fx_reverb_setup(fx_state_t *f)
 {
@@ -397,7 +397,9 @@ static __attribute__((noinline,section(".dsp_text"))) void fx_reverb(fx_state_t 
             input=fx_tone_input(f,input,FX_REV_DIV/(0.010f*FS));
             int32_t v[8],x;uint32_t off=0;
             f->rev_dc+=((float)input-f->rev_dc)*0.006f;
-            x=clamp(fx_div_pow2((int32_t)((float)input-f->rev_dc),2),-16000,16000);
+            /* Half scale, then normalised: the lines carry long quiet tails above the
+             * truncating multiplies' floor, and band noise even at RMS 12000 clamps nothing. */
+            x=clamp(fx_div_pow2((int32_t)((float)input-f->rev_dc),1),-32000,32000);
             x=fx_reverb_mul(x,(uint32_t)f->damp[3]);
             off=1610u;
             for(uint32_t k=0;k<4u;k++){x=fx_reverb_ap(f,mem,k,x,off);off+=REV_AP_LEN[k];}
